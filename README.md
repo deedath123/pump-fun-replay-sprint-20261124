@@ -9,16 +9,21 @@ A paper-trading bot for the [Pump.fun Replay Sprint](https://make.fun/bounty/u-j
 ## Strategy
 
 Buy the shakeout on curves that already gathered real demand: a coin whose price fell
-30–45% off its recent high (1500-slot window) while buyers are still stepping in
-(at least 4 of the last 6 trades are buys, the latest trade is a buy).
+30–45% off its recent high (1500-slot window, a high that once sat on 20+ SOL of real
+reserves) while buyers are still stepping in hard (at least 5 of the last 6 trades are
+buys, the latest trade is a buy) — and whose creator has not sold. A shallower dip
+(25–30%) loses money on this tape: the shakeout is not done yet.
 
-- **Strong tier** (15+ SOL real reserves): 0.35 SOL tranches up to 2.5 SOL per coin.
-- **Probe tier** (3–15 SOL): 0.05–0.08 SOL tranches up to 0.15 SOL per coin, wider
-  20–60% dip band, at most 3 probes open — these exist so the run always clears the
-  20-coin guardrail with room to spare.
-- **Exits**: take profit at +25% over cost, stop loss at −15%, or walk away after
+- **Strong tier** (15+ SOL real reserves): a 0.05 SOL first buy, then 0.35 SOL
+  tranches up to 2.5 SOL per coin.
+- **Probe tier** (3–15 SOL): a 0.05 SOL first buy, then 0.08 SOL tranches up to
+  0.15 SOL per coin, wider 20–60% dip band, at most 3 probes open — these exist so
+  the run always clears the 20-coin guardrail with room to spare.
+- **Exits**: take profit at +40% over cost, stop loss at −25%, or walk away after
   450 slots. Positions build in tranches while the price stays within 30% of the
-  first entry. No pyramids into strength, no trailing stops.
+  first entry — the adds fire into the dip, because on this tape the bounce usually
+  starts from below the entry price. No pyramids into strength, no trailing stops:
+  a 25% pullback is ordinary noise here.
 
 ## Run
 
@@ -27,11 +32,20 @@ stdin/stdout: a `hello`, then one `batch` per slot, answering each with one repl
 carrying its `orders`. It is deterministic — no clock, no environment, no randomness —
 so two executions produce byte-identical action logs.
 
-## Dev-window results (local engine)
+## Dev-window results (grade-local, `--driver process`, commit `52b26f5`)
 
-Net **+6.7 SOL** after all fees (mean over 4 failed-tx draws; worst +5.8), 759 fills,
-63 coins, 121 round trips, 39 wins, max drawdown 0.20 — against the house momentum
-pilot's −9.38 SOL on the same window.
+Net **+3.82 SOL** after all fees (return 0.38), 662 fills, 35 coins, 72 round trips,
+win rate 0.47, max drawdown 0.20 — guardrails met (35 coins with ≥0.01 SOL round
+trips, drawdown under 0.50). Without its 3 best coins the net is still +0.04 SOL,
+and at 2x fees it is +0.50 SOL. Local backtest over 4 failed-tx draws: mean +4.13,
+worst +3.95. Against the house pilots on the same full window: momentum −9.43,
+sniper −0.49, reversion −3.93.
+
+Stress test (`grade-local --stress`, 20 block surrogates): median **−3.27 SOL**,
+p10 −6.36, p90 +0.89, 14 of 20 copies lost money. The dev score depends on this
+window's own coins — the block surrogates splice ~8-trade blocks from other coins,
+which destroys the long-horizon dip→bounce pattern this bot trades, so the stress
+copies are a harsh read on a pattern that only exists in real, unspliced tape.
 
 ## Files
 
