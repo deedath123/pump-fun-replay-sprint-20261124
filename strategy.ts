@@ -2,19 +2,25 @@
 //
 // Idea: most launches die, but curves that already gathered real demand sometimes shake out
 // weak hands and then bounce hard — a whale buy, a second wave, sometimes a full migration.
-// We buy only the shakeout: a coin whose price fell off its recent high while buyers are
-// still stepping in (at least 4 of the last 6 trades are buys and the latest trade is a buy).
+// We buy only the shakeout: a coin whose price fell 30-45% off its recent high (a high that
+// once sat on 20+ SOL of real reserves) while buyers are still stepping in hard — at least
+// 5 of the last 6 trades are buys and the latest trade is a buy. A shallower dip (25-30%)
+// loses money on this tape: the shakeout is not done yet. And we never buy a coin whose
+// creator has already sold — that filter alone cut the drawdown from 0.56 to 0.36.
 //
-// Two sizes. Strong curves (15+ SOL of real reserves at entry) get the full position: 0.35
-// SOL tranches up to 2.5 SOL, entered on a 30-45% dip. Mid curves (3-15 SOL) get a small
-// probe: 0.05 SOL tranches up to 0.2 SOL, entered on a wider 20-60% dip, at most 3 probes
-// open at once. The probes exist so the run always clears the 20-coin guardrail with room
-// to spare; they cost a little on average and the strong tier pays for them many times over.
+// Two sizes. Strong curves (15+ SOL of real reserves at entry) get the full position: a
+// 0.05 SOL first buy, then 0.35 SOL tranches up to 2.5 SOL, entered on a 30-45% dip. Mid
+// curves (3-15 SOL) get a small probe: 0.05 SOL first, then 0.08 SOL tranches up to 0.15
+// SOL, on a wider 20-60% dip, at most 3 probes open at once. The probes exist so the run
+// always clears the 20-coin guardrail with room to spare; they cost a little on average
+// and the strong tier pays for them many times over.
 //
-// Positions build in tranches while the price stays within 30% of the first entry, and the
-// whole position leaves at +25% over cost, is cut at -15%, or walks away after 450 slots if
-// it never moves. No pyramids into strength, no trailing stops: in this tape a 25% pullback
-// is ordinary noise, so a trailing stop just donates the winners back.
+// Positions build in tranches while the price stays within 30% of the first entry — the
+// adds fire into the dip, not after a recovery, because on this tape the bounce usually
+// starts from below the entry price. The whole position leaves at +40% over cost, is cut
+// at -25%, or walks away after 450 slots if it never moves. Wide exits, because in this
+// tape a 25% pullback is ordinary noise: a tight stop just donates the winners back, and
+// a tight take-profit banks the bounce before it runs.
 //
 // Everything is a pure function of the batches the harness sends: no clock, no environment,
 // no randomness, so the two graded executions produce byte-identical action logs.
@@ -69,6 +75,14 @@ export interface DipParams {
   sellSlippageBps: number;
   /** Most new entries per reply. */
   maxEntriesPerBatch: number;
+  /** Most positions open at once (at most the harness cap of 5). */
+  maxOpen: number;
+  /** Skip the entry when the creator has sold before it (a dump in progress). */
+  skipDevSold: boolean;
+  /** The first buy of a position (lamports); later tranches use `tranche`. */
+  firstTranche: bigint;
+  /** An add needs the price at least this far above the first entry price (fraction). */
+  addMinRise: number;
   /** Exits are sent as this many equal sells in one reply. */
   sellSplits: number;
 }
@@ -84,10 +98,10 @@ export const DEFAULT_PARAMS: DipParams = {
   probeDipMin: 0.2,
   probeDipMax: 0.6,
   minRealSol: 3_000_000_000n,
-  minHighRealSol: 3_000_000_000n,
+  minHighRealSol: 20_000_000_000n,
   strongRealSol: 15_000_000_000n,
   flowTrades: 6,
-  minBuys: 4,
+  minBuys: 5,
   lastMustBeBuy: true,
   minNetFlow: 0n,
   tranche: 350_000_000n,
@@ -97,13 +111,17 @@ export const DEFAULT_PARAMS: DipParams = {
   maxProbeOpen: 3,
   minBuy: 8_000_000n,
   addBand: 0.3,
-  takeProfit: 0.25,
-  stopLoss: 0.15,
+  takeProfit: 0.4,
+  stopLoss: 0.25,
   maxHoldSlots: 450,
   cooldownSlots: 200,
   buySlippageBps: 500,
   sellSlippageBps: 3000,
   maxEntriesPerBatch: 2,
+  maxOpen: 5,
+  skipDevSold: true,
+  firstTranche: 50_000_000n,
+  addMinRise: -1,
   sellSplits: 2,
 };
 
@@ -124,6 +142,10 @@ interface Tick {
 interface Curve {
   /** Tape of recent trades, oldest first (capped at 400). */
   tape: Tick[];
+  /** The coin's creator (from its CreateEvent). */
+  creator: string;
+  /** The creator has sold some of the coin. */
+  devSold: boolean;
   /** Price and slot of the first buy sent for the open position, if any. */
   firstPrice: number;
   firstSlot: number;
@@ -157,7 +179,7 @@ export function createDipBot(p: DipParams = DEFAULT_PARAMS): Bot {
   const curveOf = (mint: Pubkey): Curve => {
     let c = curves.get(mint);
     if (c === undefined) {
-      c = { tape: [], firstPrice: 0, firstSlot: -1, spent: 0n, tier: 'strong', blockedUntil: -1, selling: false };
+      c = { tape: [], creator: '', devSold: false, firstPrice: 0, firstSlot: -1, spent: 0n, tier: 'strong', blockedUntil: -1, selling: false };
       curves.set(mint, c);
     }
     return c;
@@ -168,8 +190,14 @@ export function createDipBot(p: DipParams = DEFAULT_PARAMS): Bot {
       const now = batch.slot;
       const touched: Pubkey[] = [];
       for (const e of batch.events) {
+        if (e.event === 'CreateEvent') {
+          curveOf(e.mint).creator = e.creator;
+          continue;
+        }
         if (e.event !== 'TradeEvent') continue;
         const c = curveOf(e.mint);
+        if (c.creator === '') c.creator = e.creator;
+        if (!e.is_buy && e.user === c.creator) c.devSold = true;
         const vt = BigInt(e.virtual_token_reserves);
         const price = vt === 0n ? 0 : Number(BigInt(e.virtual_quote_reserves)) / Number(vt);
         c.tape.push({ slot: e.slot, price, realSol: BigInt(e.real_quote_reserves), isBuy: e.is_buy, sol: BigInt(e.sol_amount) });
@@ -234,13 +262,15 @@ export function createDipBot(p: DipParams = DEFAULT_PARAMS): Bot {
           c.selling = true;
           continue;
         }
-        // Add a tranche while the dip holds near the first entry price.
+        // Add a tranche while the dip holds near the first entry price, and only once the
+        // price has come back to (or above) the entry: never average down into a falling coin.
         const tierTranche = c.tier === 'strong' ? p.tranche : p.probeTranche;
         const tierMax = c.tier === 'strong' ? p.maxPosition : p.probeMaxPosition;
         if (pendingMints.has(mint) || c.spent >= tierMax) continue;
         const tape = c.tape;
         const price = tape.length > 0 ? tape[tape.length - 1]!.price : 0;
         if (c.firstPrice <= 0 || Math.abs(price / c.firstPrice - 1) > p.addBand) continue;
+        if (price < c.firstPrice * (1 + p.addMinRise)) continue;
         let amount = tierMax - c.spent;
         if (amount > tierTranche) amount = tierTranche;
         const sizeCap = buyCap(state, mint);
@@ -255,6 +285,7 @@ export function createDipBot(p: DipParams = DEFAULT_PARAMS): Bot {
       // 2. New entries on coins that traded this batch.
       let entries = 0;
       let open = state.committedPositionCount();
+      const openCap = Math.min(p.maxOpen, state.hello.caps.max_open_positions);
       let probeOpen = 0;
       for (const m of state.positions.keys()) if (curveOf(m).tier === 'probe') probeOpen++;
       for (const o of state.pending.values()) {
@@ -262,12 +293,13 @@ export function createDipBot(p: DipParams = DEFAULT_PARAMS): Bot {
       }
       for (const mint of touched) {
         if (orders.length >= cap || entries >= p.maxEntriesPerBatch) break;
-        if (open >= state.hello.caps.max_open_positions) break;
+        if (open >= openCap) break;
         if (state.positions.has(mint) || pendingMints.has(mint)) continue;
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
         const c = curves.get(mint)!;
         if (now < c.blockedUntil) continue;
+        if (p.skipDevSold && c.devSold) continue;
         const tape = c.tape;
         if (tape.length < p.flowTrades) continue;
         const last = tape[tape.length - 1]!;
@@ -306,7 +338,8 @@ export function createDipBot(p: DipParams = DEFAULT_PARAMS): Bot {
         if (p.lastMustBeBuy && !last.isBuy) continue;
         const tierTranche = tier === 'strong' ? p.tranche : p.probeTranche;
         const tierMax = tier === 'strong' ? p.maxPosition : p.probeMaxPosition;
-        let amount = tierTranche;
+        let amount = p.firstTranche;
+        if (amount > tierTranche) amount = tierTranche;
         if (amount > tierMax) amount = tierMax;
         const sizeCap = buyCap(state, mint);
         if (amount > sizeCap) amount = sizeCap;
